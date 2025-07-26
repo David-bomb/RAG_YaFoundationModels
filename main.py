@@ -1,14 +1,15 @@
 import os
-from dotenv import load_dotenv
+
+# Настройка кэша
 PATH = './hf_cache'
 os.environ['HF_HOME'] = PATH
 os.environ['HF_DATASETS_CACHE'] = PATH
 os.environ['TORCH_HOME'] = PATH
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-
 
 # Локальные функции RAG
 from retriever import retrieve_chunks
@@ -18,41 +19,30 @@ from generator import generate_answer
 from sentence_transformers import SentenceTransformer
 import chromadb
 
-# Модели LLM (Mistral)
+# Модели LLM (Mistral/Fallback)
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-
-print("TRANSFORMERS_CACHE:", os.environ.get("TRANSFORMERS_CACHE"))
-print("HF_HOME:", os.environ.get("HF_HOME"))
+import torch
 
 
 
 # --- Глобальная инициализация ---
-# Embedding
 embed_model = None
-# ChromaDB
 chroma_client = None
 collection = None
-# LLM
 llm_tokenizer = None
 llm_model = None
+device = None
+
+# def get_device():
+#     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Модели запросов и ответов
-class QueryRequest(BaseModel):
-    query: str
-    top_k: Optional[int] = 5
-
-class Chunk(BaseModel):
-    text: str
-    source: str
-    distance: float
-
 class QueryResponse(BaseModel):
     query: str
-    chunks: List[Chunk]
+    top_k: int
+    chunks: List[dict]
     answer: str
 
-# Административные модели
 class ReloadResponse(BaseModel):
     status: str
     message: Optional[str] = None
@@ -66,90 +56,80 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup_event():
-    """Инициализируем эмбеддинги, ChromaDB и LLM"""
     print("Starting...")
-
-    global embed_model, chroma_client, collection, llm_tokenizer, llm_model
+    """Инициализируем эмбеддинги, ChromaDB и LLM на нужном устройстве"""
+    global embed_model, chroma_client, collection, llm_tokenizer, llm_model, device
     load_dotenv()
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    print("Environment variables loaded")
+
     # 1. Модель эмбеддингов
     embed_model = SentenceTransformer('intfloat/multilingual-e5-large')
 
-    # 2. ChromaDB клиент и коллекция
+    print("Embedding model loaded")
+
+    # 2. ChromaDB
     chroma_client = chromadb.PersistentClient(path="./chromadb_data")
     collection = chroma_client.get_collection(name="yandex_foundation_models_docs")
 
-    # 3. LLM Mistral
-    # Используем токен из переменной окружения, если необходимо
+    print("Chromadb collection loaded")
+
+    # 3. LLM и устройство
+
+    print("Device loaded: {}".format(device))
     hf_token = os.getenv('HUGGINGFACE_TOKEN')
     auth_kwargs = {'use_auth_token': hf_token} if hf_token else {}
+    preferred = "mistralai/Mistral-7B-Instruct-v0.3"
+    fallback = "tiiuae/falcon-7b-instruct"
+    print("Preferred: {}".format(preferred))
     try:
-        llm_tokenizer = AutoTokenizer.from_pretrained(
-            "mistralai/Mistral-7B-Instruct-v0.3",
-            **auth_kwargs
-        )
+        llm_tokenizer = AutoTokenizer.from_pretrained(preferred, **auth_kwargs)
+        print("Tokenizer loaded")
         llm_model = AutoModelForCausalLM.from_pretrained(
-            "mistralai/Mistral-7B-Instruct-v0.3",
-            device_map="auto",
-            torch_dtype="auto",
+            preferred,
+            torch_dtype=torch.float16 if device.type=='cuda' else torch.float32,
             **auth_kwargs
         )
+        print("LLM Model loaded")
     except Exception as e:
-        # Если модель недоступна, используем fallback
-        print(f"Warning: failed to load gated Mistral model: {e}")
-        # Пример публичной альтернативы
-        fallback_model = "tiiuae/falcon-7b-instruct"
-        llm_tokenizer = AutoTokenizer.from_pretrained(fallback_model)
-        llm_model = AutoModelForCausalLM.from_pretrained(
-            fallback_model,
-            device_map="auto",
-            torch_dtype="auto"
-        )
-        print(f"Loaded fallback model: {fallback_model}")
-
-    print("Started!")
+        print("LLM Model could not be loaded")
+        print(e)
+        llm_tokenizer = AutoTokenizer.from_pretrained(fallback)
+        llm_model = AutoModelForCausalLM.from_pretrained(fallback)
+    llm_model.to(device)
+    print("LLM Model loaded to {}".format(device.type))
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Проверка состояния сервиса"""
     return {"status": "ok"}
 
-@app.post("/query", response_model=QueryResponse, tags=["Query"])
-async def query_rag(request: QueryRequest):
-    """Обрабатывает запрос: ретрив и генерация ответа"""
+@app.get("/query", response_model=QueryResponse, tags=["Query"])
+async def query_rag(query: str, top_k: int = 5):
+    """
+    top_k — количество релевантных чанков для ретривала.
+    Генерация идёт на устройстве: GPU, если доступна.
+    """
     try:
-        # 1. Ретрив
-        results = retrieve_chunks(
-            request.query,
-            request.top_k,
-            embed_model,
-            collection
-        )
-        chunks = [Chunk(text=doc, source=meta['source'], distance=dist)
-                  for doc, meta, dist in zip(
-                      results['documents'][0],
-                      results['metadatas'][0],
-                      results['distances'][0]
-                  )]
-
-        # 2. Генерация ответа
-        answer = generate_answer(
-            query=request.query,
-            chunks=chunks,
-            llm_model=llm_model,
-            llm_tokenizer=llm_tokenizer
-        )
-
-        return QueryResponse(
-            query=request.query,
-            chunks=chunks,
-            answer=answer
-        )
+        print('1.0')
+        results = retrieve_chunks(query, top_k, embed_model, collection)
+        print('1.1')
+        chunks = [
+            {"text": doc, "source": meta['source'], "distance": dist}
+            for doc, meta, dist in zip(
+                results['documents'][0],
+                results['metadatas'][0],
+                results['distances'][0]
+            )
+        ]
+        print('1.2')
+        answer = generate_answer(query, chunks, llm_model, llm_tokenizer, device)
+        print('1.3')
+        return QueryResponse(query=query, top_k=top_k, chunks=chunks, answer=answer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/reload", response_model=ReloadResponse, tags=["Admin"])
 async def reload_index():
-    """Перезагружает индекс: повторно выполняет индексирование"""
     try:
         from indexer import reindex
         reindex()
@@ -159,11 +139,9 @@ async def reload_index():
 
 @app.get("/admin/status", response_model=ReloadResponse, tags=["Admin"])
 async def index_status():
-    """Возвращает состояние индекса и модели"""
-    status = "ok" if collection is not None else "error"
-    msg = "Index is ready" if collection is not None else "Index not initialized"
+    status = "ok" if collection else "error"
+    msg = "Index is ready" if collection else "Index not initialized"
     return ReloadResponse(status=status, message=msg)
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+# Запуск:
+# uvicorn main:app --host 0.0.0.0 --port 8000 --reload
