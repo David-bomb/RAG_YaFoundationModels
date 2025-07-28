@@ -1,20 +1,44 @@
 import os
-import git
-from bs4 import BeautifulSoup
-from langchain.text_splitter import CharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-import chromadb
+
+# Настройка кэша
 PATH = './hf_cache'
-os.environ['TRANSFORMERS_CACHE'] = PATH
 os.environ['HF_HOME'] = PATH
 os.environ['HF_DATASETS_CACHE'] = PATH
 os.environ['TORCH_HOME'] = PATH
 
-# 1. Клонирование репозитория
+import git
+import re
+# Импортируем MarkdownHeaderTextSplitter
+from langchain.text_splitter import MarkdownHeaderTextSplitter
+from sentence_transformers import SentenceTransformer
+import chromadb
+from tqdm import tqdm
+
+# --- Конфигурация ---
 REPO_URL = "https://github.com/yandex-cloud/docs.git"
 REPO_DIR = "./yandex_docs"
 FOUNDATION_MODELS_PATH = os.path.join(REPO_DIR, "ru", "foundation-models")
+CHROMA_DB_PATH = "./chromadb_data"
+COLLECTION_NAME = "yandex_foundation_models_docs"
+BATCH_SIZE = 32
 
+
+def clean_markdown_content(content: str) -> str:
+    """
+    Очищает Markdown-контент от специфичных конструкций и синтаксиса.
+    """
+    # Удаление блоков {% ... %} и инлайновых {{ ... }}
+    content = re.sub(r'\{%.*?%\}', '', content, flags=re.DOTALL)
+    content = re.sub(r'\{\{.*?\}\}', '', content)
+
+    # ИЗМЕНЕНО: Добавлено правило для удаления Markdown-ссылок.
+    # Заменяет [текст](ссылка) на просто "текст".
+    content = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', content)
+
+    return content
+
+
+# 1. Клонирование репозитория
 if not os.path.exists(REPO_DIR):
     print(f"Клонирование репозитория {REPO_URL} в {REPO_DIR}...")
     git.Repo.clone_from(REPO_URL, REPO_DIR)
@@ -31,29 +55,30 @@ for root, _, files in os.walk(FOUNDATION_MODELS_PATH):
             filepath = os.path.join(root, file)
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
-                # Очистка HTML-тегов, если они есть в Markdown
-                soup = BeautifulSoup(content, 'html.parser')
-                clean_content = soup.get_text()
-                documents.append({"content": clean_content, "source": filepath})
+                if content.strip():
+                    documents.append({"content": content, "source": filepath})
 print(f"Найдено {len(documents)} документов.")
 
 # 3. Разбиение текста на чанки
-print("Разбиение документов на чанки...")
-text_splitter = CharacterTextSplitter(
-    separator="\n\n",
-    chunk_size=1000,
-    chunk_overlap=200,
-    length_function=len,
-    is_separator_regex=False,
-)
+print("Разбиение документов на чанки с помощью MarkdownHeaderTextSplitter...")
+headers_to_split_on = [
+    ("#", "Header 1"),
+    ("##", "Header 2"),
+    ("###", "Header 3"),
+]
+markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
 
 chunks = []
 for doc in documents:
-    doc_chunks = text_splitter.split_text(doc["content"])
-    for i, chunk in enumerate(doc_chunks):
+    # Сначала очищаем контент от ВСЕХ видов мусора
+    clean_content = clean_markdown_content(doc["content"])
+    # Затем разбиваем на фрагменты по заголовкам
+    doc_fragments = markdown_splitter.split_text(clean_content)
+    for i, fragment in enumerate(doc_fragments):
         chunks.append({
-            "text": chunk,
+            "text": fragment.page_content,
             "source": doc["source"],
+            "metadata": fragment.metadata,
             "chunk_id": f"{doc['source']}_{i}"
         })
 print(f"Создано {len(chunks)} чанков.")
@@ -62,44 +87,36 @@ print(f"Создано {len(chunks)} чанков.")
 print("Загрузка модели векторизации (intfloat/multilingual-e5-large)...")
 model = SentenceTransformer('intfloat/multilingual-e5-large')
 
-print("Векторизация чанков...")
-chunk_texts = [chunk["text"] for chunk in chunks]
-embeddings = model.encode(chunk_texts, show_progress_bar=True)
-
-for i, embedding in enumerate(embeddings):
-    chunks[i]["embedding"] = embedding.tolist() # Сохраняем как список для ChromaDB
-print("Векторизация завершена.")
-
 # 5. Сохранение в ChromaDB
 print("Инициализация ChromaDB...")
-client = chromadb.PersistentClient(path="./chromadb_data")
-collection_name = "yandex_foundation_models_docs"
+client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
-# Удаляем коллекцию, если она уже существует, для чистого запуска
 try:
-    client.delete_collection(name=collection_name)
-    print(f"Существующая коллекция '{collection_name}' удалена.")
-except:
-    pass # Коллекция не существует, это нормально
+    client.delete_collection(name=COLLECTION_NAME)
+    print(f"Существующая коллекция '{COLLECTION_NAME}' удалена.")
+except Exception:
+    pass
 
-collection = client.create_collection(name=collection_name)
+collection = client.create_collection(name=COLLECTION_NAME)
 
-print("Добавление чанков в ChromaDB...")
-ids = [chunk["chunk_id"] for chunk in chunks]
-metadatas = [{
-    "source": chunk["source"],
-    "text_length": len(chunk["text"])
-} for chunk in chunks]
+print(f"Векторизация и добавление чанков в ChromaDB пакетами по {BATCH_SIZE}...")
 
-# ChromaDB ожидает список списков для embeddings
-embeddings_list = [chunk["embedding"] for chunk in chunks]
+total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+for i in tqdm(range(0, len(chunks), BATCH_SIZE), desc="Обработка батчей"):
+    batch_chunks = chunks[i:i + BATCH_SIZE]
 
-collection.add(
-    embeddings=embeddings_list,
-    documents=chunk_texts,
-    metadatas=metadatas,
-    ids=ids
-)
+    batch_texts = [chunk["text"] for chunk in batch_chunks]
+    batch_ids = [chunk["chunk_id"] for chunk in batch_chunks]
+    batch_metadatas = [{"source": chunk["source"]} for chunk in batch_chunks]
+
+    batch_embeddings = model.encode(batch_texts)
+
+    collection.add(
+        embeddings=batch_embeddings.tolist(),
+        documents=batch_texts,
+        metadatas=batch_metadatas,
+        ids=batch_ids
+    )
+
 print(f"Все {len(chunks)} чанков успешно добавлены в ChromaDB.")
-print("Индексация завершена. Данные сохранены в ./chromadb_data")
-
+print(f"Индексация завершена. Данные сохранены в {CHROMA_DB_PATH}")

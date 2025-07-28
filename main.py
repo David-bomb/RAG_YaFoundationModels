@@ -5,6 +5,7 @@ PATH = './hf_cache'
 os.environ['HF_HOME'] = PATH
 os.environ['HF_DATASETS_CACHE'] = PATH
 os.environ['TORCH_HOME'] = PATH
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -87,7 +88,9 @@ async def startup_event():
         print("Tokenizer loaded")
         llm_model = AutoModelForCausalLM.from_pretrained(
             preferred,
-            torch_dtype=torch.float16 if device.type=='cuda' else torch.float32,
+            # torch_dtype=torch.float16 if device.type=='cuda' else torch.float32,
+            load_in_8bit=True, # или load_in_4bit=True для максимальной экономии
+            device_map="auto", # bitsandbytes требует device_map="auto"
             **auth_kwargs
         )
         print("LLM Model loaded")
@@ -96,8 +99,8 @@ async def startup_event():
         print(e)
         llm_tokenizer = AutoTokenizer.from_pretrained(fallback)
         llm_model = AutoModelForCausalLM.from_pretrained(fallback)
-    llm_model.to(device)
-    print("LLM Model loaded to {}".format(device.type))
+    # llm_model.to(device)
+    print("LLM Model loaded with 8-bit quantization")
 
 @app.get("/health", tags=["Health"])
 async def health_check():
@@ -122,7 +125,7 @@ async def query_rag(query: str, top_k: int = 5):
             )
         ]
         print('1.2')
-        answer = generate_answer(query, chunks, llm_model, llm_tokenizer, device)
+        answer = generate_answer(query, chunks, llm_model, llm_tokenizer)
         print('1.3')
         return QueryResponse(query=query, top_k=top_k, chunks=chunks, answer=answer)
     except Exception as e:
