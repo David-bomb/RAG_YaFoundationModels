@@ -1,8 +1,6 @@
 from typing import List
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ИЗМЕНЕНО: В шаблон добавлен четкий маркер "ОТВЕТ:",
-# который модель должна использовать для начала своего ответа.
 PROMPT_TEMPLATE = """
 Ты — DocumentAssistantPRO, умный и аккуратный технический писатель, эксперт по документации Yandex Foundation Models.
 
@@ -41,16 +39,12 @@ def generate_answer(
     context = "\n---\n".join(chunk["text"] for chunk in chunks)
     prompt = PROMPT_TEMPLATE.format(context=context, query=query)
 
-    # Убираем отладочный print, чтобы не засорять консоль
-    # print('----Полученный промт-----', prompt, '-----------------------', sep='\n')
-
     inputs = llm_tokenizer(prompt, return_tensors="pt", truncation=True,
-                           max_length=4096)  # Увеличим максимальную длину для более полного контекста
+                           max_length=4096)
 
     device = next(llm_model.parameters()).device
-    # print("Generate device:", device) # Можно закомментировать для чистоты логов
 
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs = {k: v.to(device) for k, v in inputs.items()} # переводим на нужный девайс
 
     outputs = llm_model.generate(
         **inputs,
@@ -59,8 +53,7 @@ def generate_answer(
     )
     decoded = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # ИЗМЕНЕНО: Надежный парсинг ответа по маркеру.
-    # Это решает проблему "обрезанных" ответов.
+    # Парсинг ответа по маркеру.
     answer_marker = "ОТВЕТ:"
     marker_pos = decoded.rfind(answer_marker)  # Ищем последнее вхождение маркера
 
@@ -68,8 +61,6 @@ def generate_answer(
         # Если маркер найден, берем весь текст после него
         answer = decoded[marker_pos + len(answer_marker):].strip()
     else:
-        # Если модель по какой-то причине проигнорировала маркер,
-        # используем старый метод как запасной, чтобы не вернуть пустой ответ.
         answer = decoded[len(prompt):].strip()
 
     return answer

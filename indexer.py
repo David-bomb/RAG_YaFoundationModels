@@ -1,6 +1,6 @@
 import os
 
-# Настройка кэша
+# Настройка папки установки моделей с HF
 PATH = './hf_cache'
 os.environ['HF_HOME'] = PATH
 os.environ['HF_DATASETS_CACHE'] = PATH
@@ -8,7 +8,6 @@ os.environ['TORCH_HOME'] = PATH
 
 import git
 import re
-# Импортируем MarkdownHeaderTextSplitter
 from langchain.text_splitter import MarkdownHeaderTextSplitter
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -31,14 +30,15 @@ def clean_markdown_content(content: str) -> str:
     content = re.sub(r'\{%.*?%\}', '', content, flags=re.DOTALL)
     content = re.sub(r'\{\{.*?\}\}', '', content)
 
-    # ИЗМЕНЕНО: Добавлено правило для удаления Markdown-ссылок.
     # Заменяет [текст](ссылка) на просто "текст".
     content = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', content)
+
+    # убирает пустые кавычки после шаблонизатора
+    content = re.sub(r'``', '', content)
 
     return content
 
 
-# 1. Клонирование репозитория
 if not os.path.exists(REPO_DIR):
     print(f"Клонирование репозитория {REPO_URL} в {REPO_DIR}...")
     git.Repo.clone_from(REPO_URL, REPO_DIR)
@@ -46,7 +46,7 @@ if not os.path.exists(REPO_DIR):
 else:
     print(f"Репозиторий уже существует в {REPO_DIR}. Пропускаем клонирование.")
 
-# 2. Чтение и обработка Markdown файлов
+
 print(f"Чтение Markdown файлов из {FOUNDATION_MODELS_PATH}...")
 documents = []
 for root, _, files in os.walk(FOUNDATION_MODELS_PATH):
